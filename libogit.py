@@ -98,6 +98,10 @@ def repo_create(path: Path) -> Repository:
     assert repo_dir(repo, 'refs', 'tags', mkdir=True)
     assert repo_dir(repo, 'refs', 'heads', mkdir=True)
     
+    with repo_file(repo, 'description').open('w') as f:
+        f.write('Unnamed repository; edit this file "description" to name the '
+                'repository.\n')
+    
     with repo_file(repo, 'HEAD').open('w') as f:
         f.write('ref: refs/head/master\n')
     
