@@ -112,6 +112,26 @@ def repo_create(path: Path) -> Repository:
     return repo
 
 
+def repo_find(
+        path: Path = Path('.'), 
+        required: bool = True
+) -> Repository | None:
+    path = path.resolve()
+    
+    if (path / '.ogit').is_dir():
+        return Repository(path)
+    
+    parent = (path / '..').resolve()
+    
+    if parent == path:
+        if required:
+            raise Exception('Not ogit directory')
+        else:
+            return None
+    
+    return repo_find(parent, required)
+
+
 argparser = ArgumentParser(description='The OskageGit - content tracker')
 argsubparsers = argparser.add_subparsers(title='Commands', dest='command')
 argsubparsers.required = True
