@@ -10,6 +10,7 @@ from configparser import ConfigParser
 from io import BufferedWriter
 from math import ceil
 from pathlib import Path
+from collections import namedtuple
 
 
 KeyValueWithMessage = dict[bytes, bytes | list[bytes]]
@@ -74,21 +75,67 @@ class Commit(Object):
     fmt: bytes = b'commit'
     
     def serialize(self) -> bytes:
-        return kvlm_serialize(self.kvlm)
+        return serialize_kvlm(self.kvlm)
     
     def deserialize(self, data: bytes):
-        self.kvlm = kvlm_parse(data)
+        self.kvlm = parse_lvlm(data)
+
+
+class Tree(Object):
+    fmt: bytes = b'tree'
+    
+    def serialize(self) -> bytes:
+        return serialize_tree(self)
+    
+    def deserialize(self, data: bytes):
+        self.items = parse_tree(data)
+
+
+TreeLeaf = namedtuple('TreeLeaf', ['mode', 'path', 'sha'])
+
+
+def parse_tree_leaf(raw: bytes, start: int = 0) -> TreeLeaf:
+    space = raw.find(b' ', start)
+    assert space - start in (5, 6)
+    
+    mode = raw[start: space]
+    
+    null = raw.find(b'\x00', space)
+    path = raw[space + 1: null]
+    
+    sha = format(int.from_bytes(raw[null + 1: null + 21], byteorder='big'), 
+                 '040x')
+    return null + 21, TreeLeaf(mode, path, sha)
+
+
+def parse_tree(raw: bytes) -> list[TreeLeaf]:
+    pos = 0
+    max = len(raw)
+    tree = []
+    while pos < max:
+        pos, data = parse_tree_leaf(raw, pos)
+        tree.append(data)
+    return tree
+
+
+def serialize_tree(obj: Tree):
+    result = b''
+    for item in obj.items:
+        sha = int(item.sha, 16)
+        result += (item.mode + b' ' + item.path + b'\x00' 
+                   + sha.to_bytes(20, byteorder='big'))
+    return result
 
 
 OBJECT_FORMAT_TO_CLASS: dict[bytes, type[Object]] = {
-    # b'commit': Commit,
-    # b'tree': Tree,
+    b'commit': Commit,
+    b'tree': Tree,
     # b'tag': Tag,
     b'blob': Blob,
 }
 
 
-def kvlm_parse(
+def parse_lvlm(
         raw: bytes, 
         start: int = 0, 
         dict_: dict | None = None
@@ -137,10 +184,10 @@ def kvlm_parse(
     else:
         dict_[key] = value
     
-    return kvlm_parse(raw, start=end + 1, dict_=dict_)
+    return parse_lvlm(raw, start=end + 1, dict_=dict_)
 
 
-def kvlm_serialize(kvlm: KeyValueWithMessage):
+def serialize_kvlm(kvlm: KeyValueWithMessage):
     result = b''
     
     for key in kvlm.keys():
@@ -330,6 +377,14 @@ COMMAND_TO_SUBPARSER = {
         'log',
         help='Display history of a given commit.',
     ),
+    'ls-tree': subparsers.add_parser(
+        'ls-tree',
+        help='Pretty-print a tree object.',
+    ),
+    'checkout': subparsers.add_parser(
+        'checkout',
+        help='Checkout a commit inside of a directory.',
+    ),
 }
 
 COMMAND_TO_SUBPARSER['init'].add_argument(
@@ -383,6 +438,74 @@ COMMAND_TO_SUBPARSER['log'].add_argument(
     nargs='?',
     help='Commit to start at.',
 )
+
+COMMAND_TO_SUBPARSER['ls-tree'].add_argument(
+    'object',
+    type=str,
+    help='The object to show.'
+)
+
+COMMAND_TO_SUBPARSER['checkout'].add_argument(
+    'commit',
+    type=str,
+    help='The commit or tree to checkout.',
+)
+COMMAND_TO_SUBPARSER['checkout'].add_argument(
+    'path',
+    type=Path,
+    help='The EMPTY directory to checkout on.',
+)
+
+
+def checkout_tree(
+        repo: Repository, 
+        tree: Tree, 
+        path: str | bytes | PathLike,
+):
+    path = Path(path)
+    for item in tree.items:
+        obj = read_object(repo, item.sha)
+        dest: Path = path / item.path
+        
+        if isinstance(obj, Tree):
+            dest.mkdir()
+            checkout_tree(repo, obj, path)
+        elif isinstance(obj, Blob):
+            with dest.open('wb') as f:
+                f.write(obj.blobdata)
+
+
+def cmd_checkout(args: Namespace):
+    repo = find_repo()
+    
+    obj = read_object(repo, find_object(repo, args.commit))
+    
+    if isinstance(obj, Commit):
+        obj = read_object(repo, obj.kvlm[b'tree'].decode())
+    
+    if args.path.exists():
+        if not args.path.is_dir():
+            raise Exception(f'Not a directory {args.path}!')
+        if any(args.path.iterdir()):
+            raise Exception(f'Not empty {args.path}!')
+    else:
+        args.path.mkdir()
+    
+    checkout_tree(repo, obj, str(args.path.resolve()).encode())
+
+
+def cmd_ls_tree(args: Namespace):
+    repo = find_repo()
+    obj = read_object(repo, find_object(repo, args.object, fmt=b'tree'))
+    assert isinstance(obj, Tree)
+    
+    for item in obj.items:
+        print(f'{0} {1} {2}\t {3}'.format(
+            '0' * (6 - len(item.mode)) + item.mode.decode(),
+            read_object(repo, item.sha).fmt.decode(),
+            item.sha,
+            item.path.decode(),
+        ))
 
 
 def log_graphviz(repo: Repository, sha: str, seen: set):
@@ -440,13 +563,13 @@ def cmd_init(args: Namespace):
 COMMAND_TO_HANDLER = {
     # 'add': cmd_add,
     'cat-file': cmd_cat_file,
-    # 'checkout': cmd_checkout,
+    'checkout': cmd_checkout,
     # 'commit': cmd_commit,
     'hash-object': cmd_hash_object,
     'init': cmd_init,
     'log': cmd_log,
     # 'ls-files': cmd_ls_files,
-    # 'ls-tree': cmd_ls_tree,
+    'ls-tree': cmd_ls_tree,
     # 'merge': cmd_merge,
     # 'rebase': cmd_rebase,
     # 'rm': cmd_rm,
