@@ -12,6 +12,9 @@ from math import ceil
 from pathlib import Path
 
 
+KeyValueWithMessage = dict[bytes, bytes | list[bytes]]
+
+
 class Repository:
     worktree: Path = None
     ogitdir: Path = None
@@ -67,12 +70,94 @@ class Blob(Object):
         self.blobdata = data
 
 
+class Commit(Object):
+    fmt: bytes = b'commit'
+    
+    def serialize(self) -> bytes:
+        return kvlm_serialize(self.kvlm)
+    
+    def deserialize(self, data: bytes):
+        self.kvlm = kvlm_parse(data)
+
+
 OBJECT_FORMAT_TO_CLASS: dict[bytes, type[Object]] = {
     # b'commit': Commit,
     # b'tree': Tree,
     # b'tag': Tag,
     b'blob': Blob,
 }
+
+
+def kvlm_parse(
+        raw: bytes, 
+        start: int = 0, 
+        dict_: dict | None = None
+) -> KeyValueWithMessage:
+    if dict_ is None:
+        dict_ = {}
+
+    space = raw.find(b' ', start)
+    newline = raw.find(b'\n', start)
+
+    # If space appears before newline, we have a keyword
+    
+    # Base case
+    # =========
+    # If newline appears first (or there's no space at all, in which
+    # case find returns -1), we assume a blank line. A blank line means
+    # the remainder of the data is the message.
+    if space < 0 or newline < space:
+        assert newline == start
+        dict_[b''] = raw[start + 1:]
+        return dict_
+    
+    # Recursive case
+    # ==============
+    # We read a key-value pair and recurse for the next
+    key = raw[start: space]
+    
+    # Fine the end of the value. Continuation lines begin with a space,
+    # so we loop until we find a "\n" not followe by a space.
+    end = start
+    while True:
+        end = raw.find(b'\n', end + 1)
+        if raw[end + 1] != ord(' '):
+            break
+    
+    # Grab the value
+    # Alse, drop the leading space on continuation lines
+    value = raw[space + 1: end].replace(b'\n ', b'\n')
+    
+    # Don't overwrite existing data contents
+    if key in dict_:
+        if isinstance(dict_[key], list):
+            dict_[key].append(value)
+        else:
+            dict_[key] = [dict_[key], value]
+    else:
+        dict_[key] = value
+    
+    return kvlm_parse(raw, start=end + 1, dict_=dict_)
+
+
+def kvlm_serialize(kvlm: KeyValueWithMessage):
+    result = b''
+    
+    for key in kvlm.keys():
+        # Skip the message itself
+        if key == b'':
+            continue
+        
+        if not isinstance(kvlm[key], list):
+            values = [kvlm[key]]
+        else:
+            values = kvlm[key]
+            
+        for value in values:
+            result += k + b' ' + (value.replace(b'\n', b'\n ')) + b'\n'
+    
+    result += b'\n' + kvlm[b'']
+    return result
 
 
 def read_object(repo: Repository, sha: str) -> Object:
@@ -231,15 +316,19 @@ subparsers = parser.add_subparsers(title='Commands', dest='command',
 COMMAND_TO_SUBPARSER = {
     'init': subparsers.add_parser(
         'init', 
-        help='Initialize a new, empty repository'
+        help='Initialize a new, empty repository',
     ),
     'cat-file': subparsers.add_parser(
         'cat-file', 
-        help='Provide content of repository objects.'
+        help='Provide content of repository objects.',
     ),
     'hash-object': subparsers.add_parser(
         'hash-object',
-        help='Compute object ID and optionally creates a blob from a file.'
+        help='Compute object ID and optionally creates a blob from a file.',
+    ),
+    'log': subparsers.add_parser(
+        'log',
+        help='Display history of a given commit.',
     ),
 }
 
@@ -287,6 +376,42 @@ COMMAND_TO_SUBPARSER['hash-object'].add_argument(
     help='Read object from <file>.',
 )
 
+COMMAND_TO_SUBPARSER['log'].add_argument(
+    'commit',
+    type=str,
+    default='HEAD',
+    nargs='?',
+    help='Commit to start at.',
+)
+
+
+def log_graphviz(repo: Repository, sha: str, seen: set):
+    if sha in seen:
+        return
+    seen.add(sha)
+    
+    commit = read_object(repo, sha)
+    assert isinstance(commit, Commit)
+    
+    if b'parent' not in commit.kvlm:
+        return
+    
+    parents = commit.kvlm[b"parent"]
+    if not isinstance(parents, list):
+        parents = [parents]
+    
+    for parent in parents:
+        parent = parent.decode()
+        print(f'c_{sha} -> c_{parent}')
+        log_graphviz(repo, parent, seen)
+
+
+def cmd_log(args: Namespace):
+    repo = find_repo()
+    
+    print('digraph ogitlog{')
+    
+
 
 def cat_file(repo: Repository, obj: str, fmt: bytes = None):
     obj = read_object(repo, find_object(repo, obj, fmt))
@@ -319,7 +444,7 @@ COMMAND_TO_HANDLER = {
     # 'commit': cmd_commit,
     'hash-object': cmd_hash_object,
     'init': cmd_init,
-    # 'log': cmd_log,
+    'log': cmd_log,
     # 'ls-files': cmd_ls_files,
     # 'ls-tree': cmd_ls_tree,
     # 'merge': cmd_merge,
